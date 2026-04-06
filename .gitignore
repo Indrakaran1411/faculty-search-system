@@ -1,0 +1,36 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data (auto-generated, do not commit)
+data/cache/
+data/embeddings/
+data/search_index.pkl
+
+# Sentence Transformer model cache (large files)
+.cache/
+~/.cache/huggingface/
+
+# Node
+frontend/node_modules/
+frontend/build/
+frontend/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
