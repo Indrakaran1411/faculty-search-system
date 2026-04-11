@@ -16,6 +16,15 @@ const ScholarIcon  = () => (
   </svg>
 )
 
+const formatList = (items) => (items?.filter(Boolean)?.length ? items.join(", ") : "Not available")
+const formatPublications = (publications) => {
+  if (!publications?.length) return "Not available"
+  return publications
+    .slice(0, 8)
+    .map((pub) => [pub.title, pub.year ? `(${pub.year})` : ""].filter(Boolean).join(" "))
+    .join("; ")
+}
+
 // ── Source Tag ──────────────────────────────────────────────────────
 export const SourceTag = ({ source }) => {
   const labels = { google_scholar: "Scholar", orcid: "ORCID", openalex: "OpenAlex", semantic_scholar: "Sem. Scholar" }
@@ -62,9 +71,7 @@ export default function ProfileCard({ profile, rank }) {
     ? profile.name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()
     : "??"
 
-  const hasContact = profile.email || profile.phone || profile.location || profile.homepage
-  const hasPubs    = profile.publications?.length > 0
-  const hasCourses = profile.course_works?.length > 0
+  const hasMetrics = Object.values(m).some(v => v > 0)
 
   return (
     <div className={`profile-card ${expanded ? "expanded" : ""}`}>
@@ -85,9 +92,9 @@ export default function ProfileCard({ profile, rank }) {
 
         <div className="profile-main">
           <h2 className="profile-name">{profile.name || "Unknown"}</h2>
-          {profile.designation && <div className="profile-badge designation-badge">🎓 {profile.designation}</div>}
-          {profile.university  && <div className="profile-badge university-badge">🏛 {profile.university}</div>}
-          {profile.department  && <div className="profile-badge dept-badge">📐 {profile.department}</div>}
+          <div className="profile-summary">
+            Search results are aggregated from worldwide academic sources.
+          </div>
         </div>
 
         <button className="expand-btn" onClick={() => setExpanded(!expanded)}>
@@ -95,35 +102,32 @@ export default function ProfileCard({ profile, rank }) {
         </button>
       </div>
 
-      {/* ── CONTACT STRIP ── */}
-      {hasContact && (
+      <div className="details-list">
+        <InfoRow label="Name" value={profile.name || "Not available"} />
+        <InfoRow label="Designation" value={profile.designation || "Not available"} />
+        <InfoRow label="University/Clg" value={profile.university || "Not available"} />
+        <InfoRow label="Department" value={profile.department || "Not available"} />
+        <InfoRow label="Research areas" value={formatList(profile.research_areas)} />
+        <InfoRow label="Course works" value={formatList(profile.course_works)} />
+        <InfoRow label="Publications" value={formatPublications(profile.publications)} />
+        <InfoRow label="Email" value={profile.email || "Not available"} href={profile.email ? `mailto:${profile.email}` : undefined} />
+        <InfoRow label="Contact number" value={profile.phone || "Not available"} />
+        <InfoRow label="Location" value={profile.location || "Not available"} />
+      </div>
+
+      {profile.homepage && (
         <div className="contact-strip">
-          <InfoRow icon={<EmailIcon />}    label="Email"    value={profile.email}    href={`mailto:${profile.email}`} />
-          <InfoRow icon={<PhoneIcon />}    label="Phone"    value={profile.phone} />
-          <InfoRow icon={<LocationIcon />} label="Location" value={profile.location} />
-          <InfoRow icon={<LinkIcon />}     label="Website"  value={profile.homepage} href={profile.homepage} />
+          <InfoRow icon={<LinkIcon />} label="Website" value={profile.homepage} href={profile.homepage} />
         </div>
       )}
 
-      {/* ── METRICS ── */}
-      {Object.values(m).some(v => v > 0) && (
+      {hasMetrics && (
         <div className="metrics-row">
           <MetricBadge label="Citations"  value={m.citations} />
           <MetricBadge label="h-index"    value={m.h_index} />
           <MetricBadge label="i10-index"  value={m.i10_index} />
           <MetricBadge label="Papers"     value={m.paper_count} />
         </div>
-      )}
-
-      {/* ── RESEARCH AREAS ── */}
-      {profile.research_areas?.length > 0 && (
-        <Section title="🔬 Research Areas">
-          <div className="tag-row">
-            {profile.research_areas.slice(0, 8).map((area, i) => (
-              <span key={i} className="area-tag">{area}</span>
-            ))}
-          </div>
-        </Section>
       )}
 
       {/* ── PROFILE LINKS ── */}
@@ -153,19 +157,7 @@ export default function ProfileCard({ profile, rank }) {
       {/* ── EXPANDED CONTENT ── */}
       {expanded && (
         <>
-          {/* Course Works */}
-          {hasCourses && (
-            <Section title="📚 Course Works">
-              <div className="tag-row">
-                {profile.course_works.map((c, i) => (
-                  <span key={i} className="course-tag">{c}</span>
-                ))}
-              </div>
-            </Section>
-          )}
-
-          {/* Publications */}
-          {hasPubs && (
+          {profile.publications?.length > 0 && (
             <Section title="📄 Publications">
               <ul className="pub-list">
                 {profile.publications.slice(0, 10).map((pub, i) => (

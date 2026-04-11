@@ -49,6 +49,16 @@ def _publication_overlap(a: List[Dict], b: List[Dict]) -> float:
     return overlap
 
 
+def _shared_identifier(a: Dict, b: Dict) -> bool:
+    keys = ["orcid_id", "orcid_url", "openalex_url", "scholar_id", "semantic_scholar_url"]
+    for key in keys:
+        av = (a.get(key) or "").strip().lower()
+        bv = (b.get(key) or "").strip().lower()
+        if av and bv and av == bv:
+            return True
+    return False
+
+
 class EntityResolver:
     def __init__(self, name_threshold=0.82, merge_threshold=0.55):
         self.name_threshold = name_threshold
@@ -128,6 +138,8 @@ class EntityResolver:
         return clusters
 
     def _are_same_person(self, a: Dict, b: Dict) -> bool:
+        if _shared_identifier(a, b):
+            return True
         name_sim = _name_similarity(a.get("name", ""), b.get("name", ""))
         if name_sim < self.name_threshold:
             return False
@@ -142,11 +154,10 @@ class EntityResolver:
             return cluster[0]
 
         merged = {}
-        # Priority: google_scholar > semantic_scholar > openalex > orcid
-        source_priority = ["google_scholar", "semantic_scholar", "openalex", "orcid"]
+        default_priority = ["google_scholar", "semantic_scholar", "openalex", "orcid"]
 
-        def best_value(key: str, default=None):
-            for src in source_priority:
+        def best_value(key: str, default=None, priority=None):
+            for src in (priority or default_priority):
                 for p in cluster:
                     if p.get("source") == src and p.get(key):
                         return p[key]
@@ -156,10 +167,19 @@ class EntityResolver:
             return default
 
         merged["name"] = best_value("name", "")
+        employment_priority = ["orcid", "google_scholar", "openalex", "semantic_scholar"]
+        merged["designation"] = best_value("designation", "", employment_priority)
+        merged["university"] = best_value("university", "", employment_priority)
+        merged["department"] = best_value("department", "", employment_priority)
         merged["affiliations"] = list(set(
             aff for p in cluster for aff in p.get("affiliations", []) if aff
         ))
         merged["email"] = best_value("email", "")
+        merged["phone"] = best_value("phone", "")
+        merged["location"] = best_value("location", "", employment_priority)
+        merged["course_works"] = list(dict.fromkeys(
+            course for p in cluster for course in p.get("course_works", []) if course
+        ))[:10]
         merged["homepage"] = best_value("homepage", "")
         merged["profile_image"] = best_value("profile_image", "")
         merged["research_areas"] = list(set(
@@ -169,6 +189,7 @@ class EntityResolver:
         merged["h_index"] = max((p.get("h_index", 0) for p in cluster), default=0)
         merged["i10_index"] = max((p.get("i10_index", 0) for p in cluster), default=0)
         merged["paper_count"] = max((p.get("paper_count", 0) for p in cluster), default=0)
+        merged["source_relevance"] = max((p.get("source_relevance", 0) for p in cluster), default=0)
         merged["scholar_url"] = best_value("scholar_url", "")
         merged["scholar_id"] = best_value("scholar_id", "")
         merged["orcid_url"] = best_value("orcid_url", "")

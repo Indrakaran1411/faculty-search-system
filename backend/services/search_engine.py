@@ -13,6 +13,7 @@ import pickle
 import numpy as np
 from typing import List, Dict, Optional
 from pathlib import Path
+from math import log10
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,34 @@ class HybridSearchEngine:
         )
         result = []
         for prof, score in ranked:
-            prof["relevance_score"] = round(float(score), 4)
+            quality_bonus = self._quality_bonus(prof)
+            prof["relevance_score"] = round(float(score + quality_bonus), 4)
             result.append(prof)
+        result.sort(key=lambda prof: prof.get("relevance_score", 0), reverse=True)
         return result
+
+    def _quality_bonus(self, profile: Dict) -> float:
+        citations = max(int(profile.get("metrics", {}).get("citations", 0) or 0), 0)
+        papers = max(int(profile.get("metrics", {}).get("paper_count", 0) or 0), 0)
+        disambiguation = float(profile.get("disambiguation_score", 0) or 0)
+        source_relevance = float(profile.get("source_relevance", 0) or 0)
+        richness = sum(
+            1 for value in [
+                profile.get("university"),
+                profile.get("department"),
+                profile.get("location"),
+                profile.get("email"),
+                profile.get("phone"),
+                profile.get("research_areas"),
+                profile.get("publications"),
+            ] if value
+        )
+        citation_bonus = min(log10(citations + 1) / 50, 0.12)
+        paper_bonus = min(log10(papers + 1) / 80, 0.05)
+        source_bonus = min(log10(source_relevance + 1) / 100, 0.08) if source_relevance > 0 else 0
+        disambiguation_bonus = disambiguation / 100
+        richness_bonus = min(richness * 0.005, 0.03)
+        return citation_bonus + paper_bonus + source_bonus + disambiguation_bonus + richness_bonus
 
     def _bm25_score(self, profiles: List[Dict], query: str) -> List[float]:
         try:

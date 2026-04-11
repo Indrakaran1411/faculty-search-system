@@ -16,7 +16,7 @@ export default function SearchBar({ query, setQuery, affiliation, setAffiliation
         <input
           className="search-input"
           type="text"
-          placeholder="Faculty name (e.g. Andrew Ng, Geoffrey Hinton)"
+          placeholder="Professor name (global search, e.g. Andrew Ng, Geoffrey Hinton)"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKey}
@@ -47,7 +47,7 @@ export default function SearchBar({ query, setQuery, affiliation, setAffiliation
         disabled={loading || !query.trim()}
       >
         {loading ? <span className="spinner" /> : <SearchIcon />}
-        {loading ? "Searching..." : "Search Faculty"}
+        {loading ? "Searching..." : "Search Professor"}
       </button>
     </div>
   )

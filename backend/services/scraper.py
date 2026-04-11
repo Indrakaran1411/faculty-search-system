@@ -12,6 +12,7 @@ import aiohttp
 import logging
 import re
 import requests
+from urllib.parse import urlparse, parse_qs, unquote
 from typing import List, Dict, Optional
 from bs4 import BeautifulSoup
 
@@ -27,33 +28,115 @@ class FacultyScraper:
             "Accept": "text/html,application/xhtml+xml,application/json,*/*",
             "Accept-Language": "en-US,en;q=0.9",
         }
+        self.request_timeout = 5
+        self.search_result_limit = 6
 
     def _connector(self):
         return aiohttp.TCPConnector(ssl=False)
+
+    def _normalize_country(self, country_code: str) -> str:
+        countries = {
+            "CA": "Canada",
+            "US": "United States",
+            "GB": "United Kingdom",
+            "FR": "France",
+            "DE": "Germany",
+            "IL": "Israel",
+            "KR": "South Korea",
+            "SG": "Singapore",
+            "PL": "Poland",
+            "AT": "Austria",
+            "GH": "Ghana",
+            "DZ": "Algeria",
+            "ID": "Indonesia",
+            "CN": "China",
+            "CO": "Colombia",
+        }
+        return countries.get((country_code or "").upper(), country_code or "")
+
+    def _extract_openalex_affiliations(self, author: Dict):
+        raw_affiliations = author.get("affiliations", []) or []
+        last_known = author.get("last_known_institutions", []) or []
+        institutions = []
+
+        for item in raw_affiliations:
+            institution = item.get("institution", {}) or {}
+            years = item.get("years", []) or []
+            name = institution.get("display_name", "")
+            if name:
+                institutions.append({
+                    "name": name,
+                    "country": self._normalize_country(institution.get("country_code", "")),
+                    "type": institution.get("type", ""),
+                    "recent_year": max(years) if years else 0,
+                })
+
+        if not institutions:
+            for institution in last_known:
+                name = institution.get("display_name", "")
+                if name:
+                    institutions.append({
+                        "name": name,
+                        "country": self._normalize_country(institution.get("country_code", "")),
+                        "type": institution.get("type", ""),
+                        "recent_year": 0,
+                    })
+
+        seen = set()
+        deduped = []
+        for institution in sorted(
+            institutions,
+            key=lambda item: (
+                0 if item["type"] == "education" else 1,
+                -item["recent_year"],
+                item["name"],
+            ),
+        ):
+            key = institution["name"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(institution)
+
+        names = [item["name"] for item in deduped[:5]]
+        primary = deduped[0] if deduped else {}
+        location = ", ".join(filter(None, [primary.get("name", ""), primary.get("country", "")]))
+        return names, primary.get("name", ""), location
 
     # ─────────────────────────────────────────────
     # MAIN
     # ─────────────────────────────────────────────
     async def fetch_all(self, name: str, affiliation: Optional[str] = None, research_area: Optional[str] = None) -> List[Dict]:
         tasks = [
-            self._fetch_openalex(name, affiliation),
-            self._fetch_semantic_scholar(name, affiliation),
-            self._fetch_orcid(name, affiliation),
+            asyncio.create_task(self._fetch_openalex(name, affiliation)),
+            asyncio.create_task(self._fetch_semantic_scholar(name, affiliation)),
+            asyncio.create_task(self._fetch_orcid(name, affiliation)),
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        combined = []
-        for r in results:
-            if isinstance(r, list):
-                combined.extend(r)
+        done, pending = await asyncio.wait(tasks, timeout=self.request_timeout + 1)
+        for pending_task in pending:
+            pending_task.cancel()
 
-        # Direct Scholar scrape in thread
-        try:
-            scholar = await asyncio.get_event_loop().run_in_executor(
-                None, self._scrape_scholar_direct, name, affiliation
-            )
-            combined.extend(scholar)
-        except Exception as e:
-            logger.warning(f"Scholar scrape error: {e}")
+        combined = []
+        for task in done:
+            try:
+                result = task.result()
+                if isinstance(result, list):
+                    combined.extend(result)
+            except Exception as e:
+                logger.warning(f"Primary source task failed: {e}")
+
+        # Only attempt Scholar as a last resort, and cap it tightly.
+        if not combined:
+            try:
+                scholar = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, self._scrape_scholar_direct, name, affiliation
+                    ),
+                    timeout=4,
+                )
+                combined.extend(scholar)
+            except Exception as e:
+                logger.warning(f"Scholar scrape error: {e}")
 
         logger.info(f"Total raw profiles: {len(combined)}")
         return combined
@@ -67,11 +150,11 @@ class FacultyScraper:
         try:
             query = name + (f" {affiliation}" if affiliation else "")
             url = f"https://scholar.google.com/citations?view_op=search_authors&mauthors={requests.utils.quote(query)}&hl=en"
-            r = requests.get(url, headers=self.headers, timeout=10, verify=False)
+            r = requests.get(url, headers=self.headers, timeout=self.request_timeout, verify=False)
 
             if r.status_code != 200 or "accounts.google" in r.url:
-                logger.warning("Scholar blocked, trying scholarly library...")
-                return self._try_scholarly(name, affiliation)
+                logger.warning("Scholar blocked, skipping Google Scholar source for this query.")
+                return []
 
             soup = BeautifulSoup(r.text, "html.parser")
             cards = soup.find_all("div", class_="gsc_1usr")
@@ -125,7 +208,7 @@ class FacultyScraper:
             return results
         except Exception as e:
             logger.warning(f"Scholar direct scrape error: {e}")
-            return self._try_scholarly(name, affiliation)
+            return []
 
     def _get_scholar_profile(self, scholar_id: str):
         """Get citations and publications from scholar profile page."""
@@ -262,80 +345,256 @@ class FacultyScraper:
             logger.warning(f"Homepage scrape error: {e}")
         return phone, location[:60], courses[:5]
 
+    def _page_text(self, soup: BeautifulSoup) -> str:
+        return re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True))
+
+    def _extract_email(self, text: str) -> str:
+        matches = re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", text, re.IGNORECASE)
+        for email in matches:
+            clean = email.strip(".,;:()[]{}")
+            if "example." not in clean.lower():
+                return clean.lower()
+        return ""
+
+    def _extract_department(self, soup: BeautifulSoup, text: str) -> str:
+        patterns = [
+            r"(Department of [A-Za-z&,\- ]{3,80})",
+            r"(School of [A-Za-z&,\- ]{3,80})",
+            r"(Faculty of [A-Za-z&,\- ]{3,80})",
+            r"(Computer science and operations research)",
+        ]
+        title_texts = [tag.get_text(" ", strip=True) for tag in soup.find_all(["h1", "h2", "h3", "title", "strong"])[:25]]
+        haystack = " ".join(title_texts) + " " + text[:4000]
+        for pattern in patterns:
+            match = re.search(pattern, haystack, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" ,.;:")
+        return ""
+
+    def _extract_designation(self, text: str) -> str:
+        titles = [
+            "Full Professor", "Associate Professor", "Assistant Professor",
+            "Professor", "Lecturer", "Senior Lecturer", "Research Scientist",
+            "Researcher", "Chair", "Director", "Dean", "Head",
+        ]
+        for title in titles:
+            if re.search(rf"\b{re.escape(title)}\b", text, re.IGNORECASE):
+                return title
+        return ""
+
+    def _extract_courses(self, text: str) -> List[str]:
+        courses = []
+        patterns = [
+            r"(?:teaches|teaching|courses|coursework|course work)[:\s]+([A-Za-z0-9,&\- /]{6,120})",
+            r"\b([A-Z]{2,5}\s*\d{3,4}\s*[-:]\s*[A-Za-z0-9,&\- /]{4,100})",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                course = re.sub(r"\s+", " ", match.group(1)).strip(" ,.;:")
+                if 4 < len(course) < 100 and course not in courses:
+                    courses.append(course)
+                if len(courses) >= 5:
+                    return courses
+        return courses
+
+    def _extract_location(self, soup: BeautifulSoup, text: str, fallback: str) -> str:
+        patterns = [
+            r"(?:Office|Room|Building|Location)[:\s]+([A-Za-z0-9,\- .]{5,80})",
+            r"(?:Address)[:\s]+([A-Za-z0-9,\- .]{5,120})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" ,.;:")
+        meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+        if meta and meta.get("content") and fallback and fallback.lower() not in meta["content"].lower():
+            return fallback
+        return fallback
+
+    def _resolve_search_result_url(self, href: str) -> str:
+        if not href:
+            return ""
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/l/?"):
+            parsed = urlparse(href)
+            target = parse_qs(parsed.query).get("uddg", [""])[0]
+            return unquote(target)
+        return href
+
+    def _score_candidate_url(self, url: str, query_name: str, university: str) -> int:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        score = 0
+        if host.endswith(".edu") or host.endswith(".ac.uk") or host.endswith(".edu.au") or host.endswith(".ac.in"):
+            score += 4
+        if any(token in path for token in ["/faculty", "/people", "/person", "/profile", "/staff", "/directory"]):
+            score += 3
+        if any(token in path for token in ["/scholar", "/openalex", "/semantic-scholar", "/orcid"]):
+            score -= 6
+        if query_name:
+            parts = [part.lower() for part in query_name.split() if len(part) > 2]
+            score += sum(1 for part in parts if part in url.lower())
+        if university:
+            for token in re.findall(r"[A-Za-z]{4,}", university.lower()):
+                if token in url.lower():
+                    score += 1
+        return score
+
+    def _search_faculty_pages(self, query_name: str, university: str) -> List[str]:
+        query = f'{query_name} {university} faculty email phone'
+        try:
+            response = requests.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers=self.headers,
+                timeout=self.request_timeout,
+            )
+            if response.status_code != 200:
+                return []
+            soup = BeautifulSoup(response.text, "html.parser")
+            urls = []
+            for anchor in soup.select("a.result__a, a[href]"):
+                url = self._resolve_search_result_url(anchor.get("href", ""))
+                if not url.startswith("http"):
+                    continue
+                if url not in urls:
+                    urls.append(url)
+            urls.sort(key=lambda url: self._score_candidate_url(url, query_name, university), reverse=True)
+            return urls[:self.search_result_limit]
+        except Exception as e:
+            logger.warning(f"Faculty page search error: {e}")
+            return []
+
+    def _enrich_from_url(self, profile: Dict, url: str) -> Dict:
+        enriched = {}
+        try:
+            response = requests.get(url, headers=self.headers, timeout=self.request_timeout, verify=False)
+            if response.status_code != 200 or "text/html" not in response.headers.get("Content-Type", ""):
+                return enriched
+            soup = BeautifulSoup(response.text, "html.parser")
+            text = self._page_text(soup)
+            if profile.get("name") and profile["name"].split()[0].lower() not in text.lower():
+                return enriched
+
+            email = self._extract_email(text)
+            phone, page_location, courses = self._scrape_homepage(url)
+            department = self._extract_department(soup, text)
+            designation = self._extract_designation(text)
+            fallback_university = profile.get("university", "") or (profile.get("affiliations") or [""])[0]
+            location = self._extract_location(soup, text, profile.get("location", "") or page_location)
+
+            enriched = {
+                "homepage": url,
+                "email": email,
+                "phone": phone,
+                "department": department,
+                "designation": designation,
+                "course_works": courses,
+                "location": location,
+                "university": fallback_university,
+            }
+            return {key: value for key, value in enriched.items() if value}
+        except Exception as e:
+            logger.warning(f"URL enrichment error for {url}: {e}")
+            return {}
+
+    async def enrich_profile(self, profile: Dict) -> Dict:
+        university = profile.get("university", "") or (profile.get("affiliations") or [""])[0]
+        if not profile.get("name"):
+            return profile
+
+        if profile.get("homepage"):
+            homepage_data = await asyncio.to_thread(self._enrich_from_url, profile, profile["homepage"])
+            if homepage_data:
+                profile.update({k: v for k, v in homepage_data.items() if v and not profile.get(k)})
+                if profile.get("course_works") or profile.get("email") or profile.get("phone"):
+                    return profile
+
+        candidate_urls = await asyncio.to_thread(self._search_faculty_pages, profile["name"], university)
+        for url in candidate_urls:
+            page_data = await asyncio.to_thread(self._enrich_from_url, profile, url)
+            if not page_data:
+                continue
+            for key, value in page_data.items():
+                if value and not profile.get(key):
+                    profile[key] = value
+            if url and not profile.get("homepage"):
+                profile["homepage"] = url
+            if profile.get("email") or profile.get("phone") or profile.get("department") or profile.get("course_works"):
+                break
+        return profile
+
     # ─────────────────────────────────────────────
     # OPENALEX
     # ─────────────────────────────────────────────
     async def _fetch_openalex(self, name: str, affiliation: Optional[str]) -> List[Dict]:
-        params = {"search": name, "per-page": 8, "mailto": "faculty-search@local.dev"}
+        params = {"search": name, "per-page": 20, "mailto": "faculty-search@local.dev"}
         try:
-            async with aiohttp.ClientSession(connector=self._connector()) as session:
-                async with session.get("https://api.openalex.org/authors", params=params,
-                    headers=self.headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    results = []
-                    for a in data.get("results", []):
-                        inst = a.get("last_known_institution") or {}
-                        concepts = a.get("x_concepts", [])
-                        research_areas = [c.get("display_name", "") for c in concepts[:6] if c.get("level", 0) <= 2]
-                        uni = inst.get("display_name", "")
-                        country = inst.get("country_code", "")
+            data = await asyncio.to_thread(
+                self._request_json,
+                "https://api.openalex.org/authors",
+                params,
+                {},
+            )
+            results = []
+            for a in data.get("results", []):
+                affiliations, university, location = self._extract_openalex_affiliations(a)
+                concepts = a.get("x_concepts", [])
+                research_areas = [c.get("display_name", "") for c in concepts[:6] if c.get("level", 0) <= 2]
 
-                        # Fetch detailed works for publications
-                        author_id = a.get("id", "").split("/")[-1]
-                        publications = await self._fetch_openalex_works(author_id, session)
+                author_id = a.get("id", "").split("/")[-1]
+                publications = await asyncio.to_thread(self._fetch_openalex_works, author_id)
 
-                        results.append({
-                            "source": "openalex",
-                            "name": a.get("display_name", ""),
-                            "affiliations": [uni] if uni else [],
-                            "university": uni,
-                            "designation": "",
-                            "department": "",
-                            "location": country,
-                            "email": "",
-                            "phone": "",
-                            "course_works": [],
-                            "paper_count": a.get("works_count", 0),
-                            "citation_count": a.get("cited_by_count", 0),
-                            "h_index": a.get("summary_stats", {}).get("h_index", 0),
-                            "i10_index": a.get("summary_stats", {}).get("i10_index", 0),
-                            "openalex_url": a.get("id", ""),
-                            "orcid_url": a.get("orcid", ""),
-                            "research_areas": research_areas,
-                            "homepage": "",
-                            "publications": publications,
-                            "profile_image": "",
-                        })
-                    return results
+                results.append({
+                    "source": "openalex",
+                    "name": a.get("display_name", ""),
+                    "affiliations": affiliations,
+                    "university": university,
+                    "designation": "",
+                    "department": "",
+                    "location": location,
+                    "email": "",
+                    "phone": "",
+                    "course_works": [],
+                    "paper_count": a.get("works_count", 0),
+                    "citation_count": a.get("cited_by_count", 0),
+                    "h_index": a.get("summary_stats", {}).get("h_index", 0),
+                    "i10_index": a.get("summary_stats", {}).get("i10_index", 0),
+                    "source_relevance": float(a.get("relevance_score", 0) or 0),
+                    "openalex_url": a.get("id", ""),
+                    "orcid_url": a.get("orcid", ""),
+                    "research_areas": research_areas,
+                    "homepage": "",
+                    "publications": publications,
+                    "profile_image": "",
+                })
+            return results
         except Exception as e:
             logger.warning(f"OpenAlex error: {e}")
             return []
 
-    async def _fetch_openalex_works(self, author_id: str, session) -> List[Dict]:
+    def _fetch_openalex_works(self, author_id: str) -> List[Dict]:
         """Fetch top publications for an OpenAlex author."""
         try:
-            url = f"https://api.openalex.org/works"
+            url = "https://api.openalex.org/works"
             params = {
                 "filter": f"author.id:{author_id}",
                 "sort": "cited_by_count:desc",
-                "per-page": 10
+                "per-page": 12
             }
-            async with session.get(url, params=params, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                works = []
-                for w in data.get("results", []):
-                    title = w.get("title", "")
-                    year = w.get("publication_year", "")
-                    citations = w.get("cited_by_count", 0)
-                    venue = w.get("primary_location", {}).get("source", {})
-                    venue_name = venue.get("display_name", "") if venue else ""
-                    if title:
-                        works.append({"title": title, "year": str(year) if year else "", "citations": citations, "venue": venue_name})
-                return works
+            data = self._request_json(url, params, {})
+            works = []
+            for w in data.get("results", []):
+                title = w.get("title", "")
+                year = w.get("publication_year", "")
+                citations = w.get("cited_by_count", 0)
+                venue = w.get("primary_location", {}).get("source", {})
+                venue_name = venue.get("display_name", "") if venue else ""
+                if title:
+                    works.append({"title": title, "year": str(year) if year else "", "citations": citations, "venue": venue_name})
+            return works
         except Exception:
             return []
 
@@ -345,42 +604,42 @@ class FacultyScraper:
     async def _fetch_semantic_scholar(self, name: str, affiliation: Optional[str]) -> List[Dict]:
         query = name + (f" {affiliation}" if affiliation else "")
         params = {
-            "query": query, "limit": 8,
+            "query": query, "limit": 20,
             "fields": "name,affiliations,paperCount,citationCount,hIndex,homepage,papers.title,papers.year,papers.citationCount,papers.venue"
         }
         try:
-            async with aiohttp.ClientSession(connector=self._connector()) as session:
-                async with session.get("https://api.semanticscholar.org/graph/v1/author/search",
-                    params=params, headers=self.headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    results = []
-                    for a in data.get("data", []):
-                        papers = a.get("papers", [])
-                        affils = [af.get("name", "") for af in a.get("affiliations", [])]
-                        designation, department, university = self._parse_affiliation(" | ".join(affils))
-                        results.append({
-                            "source": "semantic_scholar",
-                            "name": a.get("name", ""),
-                            "affiliations": affils,
-                            "designation": designation,
-                            "department": department,
-                            "university": university,
-                            "email": "", "phone": "", "location": "", "course_works": [],
-                            "paper_count": a.get("paperCount", 0),
-                            "citation_count": a.get("citationCount", 0),
-                            "h_index": a.get("hIndex", 0),
-                            "homepage": a.get("homepage", ""),
-                            "semantic_scholar_url": f"https://www.semanticscholar.org/author/{a.get('authorId', '')}",
-                            "research_areas": [],
-                            "profile_image": "",
-                            "publications": [
-                                {"title": p.get("title", ""), "year": p.get("year"), "citations": p.get("citationCount", 0), "venue": p.get("venue", "") or ""}
-                                for p in sorted(papers, key=lambda x: x.get("citationCount", 0), reverse=True)[:10]
-                            ]
-                        })
-                    return results
+            data = await asyncio.to_thread(
+                self._request_json,
+                "https://api.semanticscholar.org/graph/v1/author/search",
+                params,
+                {},
+            )
+            results = []
+            for a in data.get("data", []):
+                papers = a.get("papers", [])
+                affils = [af.get("name", "") for af in a.get("affiliations", [])]
+                designation, department, university = self._parse_affiliation(" | ".join(affils))
+                results.append({
+                    "source": "semantic_scholar",
+                    "name": a.get("name", ""),
+                    "affiliations": affils,
+                    "designation": designation,
+                    "department": department,
+                    "university": university,
+                    "email": "", "phone": "", "location": "", "course_works": [],
+                    "paper_count": a.get("paperCount", 0),
+                    "citation_count": a.get("citationCount", 0),
+                    "h_index": a.get("hIndex", 0),
+                    "homepage": a.get("homepage", ""),
+                    "semantic_scholar_url": f"https://www.semanticscholar.org/author/{a.get('authorId', '')}",
+                    "research_areas": [],
+                    "profile_image": "",
+                    "publications": [
+                        {"title": p.get("title", ""), "year": p.get("year"), "citations": p.get("citationCount", 0), "venue": p.get("venue", "") or ""}
+                        for p in sorted(papers, key=lambda x: x.get("citationCount", 0), reverse=True)[:10]
+                    ]
+                })
+            return results
         except Exception as e:
             logger.warning(f"Semantic Scholar error: {e}")
             return []
@@ -394,85 +653,92 @@ class FacultyScraper:
         if affiliation:
             query += f" AND affiliation-org-name:{affiliation}"
         try:
-            async with aiohttp.ClientSession(connector=self._connector()) as session:
-                async with session.get("https://pub.orcid.org/v3.0/search/",
-                    params={"q": query, "rows": 5},
-                    headers={**self.headers, "Accept": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    profiles = []
-                    for item in (data.get("result", []) or []):
-                        orcid_id = item.get("orcid-identifier", {}).get("path", "")
-                        if orcid_id:
-                            detail = await self._fetch_orcid_detail(orcid_id, session)
-                            if detail:
-                                profiles.append(detail)
-                    return profiles
+            data = await asyncio.to_thread(
+                self._request_json,
+                "https://pub.orcid.org/v3.0/search/",
+                {"q": query, "rows": 10},
+                {"Accept": "application/json"},
+            )
+            profiles = []
+            for item in (data.get("result", []) or []):
+                orcid_id = item.get("orcid-identifier", {}).get("path", "")
+                if orcid_id:
+                    detail = await asyncio.to_thread(self._fetch_orcid_detail, orcid_id)
+                    if detail:
+                        profiles.append(detail)
+            return profiles
         except Exception as e:
             logger.warning(f"ORCID error: {e}")
             return []
 
-    async def _fetch_orcid_detail(self, orcid_id: str, session) -> Optional[Dict]:
+    def _fetch_orcid_detail(self, orcid_id: str) -> Optional[Dict]:
         try:
-            async with session.get(
+            data = self._request_json(
                 f"https://pub.orcid.org/v3.0/{orcid_id}/record",
-                headers={**self.headers, "Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                person = data.get("person", {})
-                name_data = person.get("name", {})
-                emails = person.get("emails", {}).get("email", [])
-                email = emails[0].get("email", "") if emails else ""
-                activities = data.get("activities-summary", {})
-                employments = activities.get("employments", {}).get("affiliation-group", [])
-                affiliations, designation, department, university, location = [], "", "", "", ""
-                for emp in employments[:3]:
-                    for s in emp.get("summaries", []):
-                        es = s.get("employment-summary", {})
-                        org = es.get("organization", {})
-                        role = es.get("role-title", "")
-                        dept = es.get("department-name", "")
-                        org_name = org.get("name", "")
-                        addr = org.get("address", {})
-                        city = addr.get("city", "")
-                        country = addr.get("country", "")
-                        if org_name:
-                            affiliations.append(org_name)
-                            if not university: university = org_name
-                        if role and not designation: designation = role
-                        if dept and not department: department = dept
-                        if (city or country) and not location:
-                            location = f"{city}, {country}".strip(", ")
-                works = activities.get("works", {}).get("group", [])
-                publications = []
-                for w in works[:15]:
-                    ws = w.get("work-summary", [{}])[0]
-                    title = ws.get("title", {}).get("title", {}).get("value", "")
-                    year = ws.get("publication-date", {}).get("year", {}).get("value", "")
-                    if title:
-                        publications.append({"title": title, "year": year, "citations": 0, "venue": ""})
-                given = name_data.get("given-names", {}).get("value", "")
-                family = name_data.get("family-name", {}).get("value", "")
-                return {
-                    "source": "orcid",
-                    "name": f"{given} {family}".strip(),
-                    "orcid_id": orcid_id,
-                    "orcid_url": f"https://orcid.org/{orcid_id}",
-                    "email": email, "phone": "",
-                    "affiliations": affiliations,
-                    "designation": designation, "department": department,
-                    "university": university, "location": location,
-                    "course_works": [], "publications": publications,
-                    "paper_count": len(works), "citation_count": 0,
-                    "h_index": 0, "homepage": "", "research_areas": [], "profile_image": "",
-                }
+                None,
+                {"Accept": "application/json"},
+            )
+            person = data.get("person") or {}
+            name_data = person.get("name") or {}
+            emails = (person.get("emails") or {}).get("email") or []
+            email = emails[0].get("email", "") if emails and isinstance(emails[0], dict) else ""
+            activities = data.get("activities-summary") or {}
+            employments = (activities.get("employments") or {}).get("affiliation-group") or []
+            affiliations, designation, department, university, location = [], "", "", "", ""
+            for emp in employments[:3]:
+                for s in emp.get("summaries") or []:
+                    es = s.get("employment-summary") or {}
+                    org = es.get("organization") or {}
+                    role = es.get("role-title", "")
+                    dept = es.get("department-name", "")
+                    org_name = org.get("name", "")
+                    addr = org.get("address") or {}
+                    city = addr.get("city", "")
+                    country = addr.get("country", "")
+                    if org_name:
+                        affiliations.append(org_name)
+                        if not university: university = org_name
+                    if role and not designation: designation = role
+                    if dept and not department: department = dept
+                    if (city or country) and not location:
+                        location = f"{city}, {country}".strip(", ")
+            works = (activities.get("works") or {}).get("group") or []
+            publications = []
+            for w in works[:15]:
+                summaries = w.get("work-summary") or [{}]
+                ws = summaries[0] if summaries else {}
+                title = ((ws.get("title") or {}).get("title") or {}).get("value", "")
+                year = ((ws.get("publication-date") or {}).get("year") or {}).get("value", "")
+                if title:
+                    publications.append({"title": title, "year": year, "citations": 0, "venue": ""})
+            given = (name_data.get("given-names") or {}).get("value", "")
+            family = (name_data.get("family-name") or {}).get("value", "")
+            return {
+                "source": "orcid",
+                "name": f"{given} {family}".strip(),
+                "orcid_id": orcid_id,
+                "orcid_url": f"https://orcid.org/{orcid_id}",
+                "email": email, "phone": "",
+                "affiliations": affiliations,
+                "designation": designation, "department": department,
+                "university": university, "location": location,
+                "course_works": [], "publications": publications,
+                "paper_count": len(works), "citation_count": 0,
+                "h_index": 0, "homepage": "", "research_areas": [], "profile_image": "",
+            }
         except Exception as e:
             logger.warning(f"ORCID detail error: {e}")
             return None
+
+    def _request_json(self, url: str, params: Optional[Dict], extra_headers: Dict) -> Dict:
+        response = requests.get(
+            url,
+            params=params,
+            headers={**self.headers, **extra_headers},
+            timeout=self.request_timeout,
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def fetch_by_scholar_id(self, scholar_id: str) -> Optional[Dict]:
         try:

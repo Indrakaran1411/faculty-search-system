@@ -6,6 +6,9 @@ FastAPI backend entry point — imports routers, registers middleware
 import logging
 import sys
 import os
+import asyncio
+import re
+from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,6 +27,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
+SEARCH_MEMORY_TTL_SECONDS = 30 * 24 * 3600
+BACKGROUND_ENRICH_LIMIT = 10
 
 app = FastAPI(
     title="Faculty Information Retrieval System",
@@ -51,6 +56,141 @@ search_engine = HybridSearchEngine()
 entity_resolver = EntityResolver()
 profile_builder = ProfileBuilder()
 cache = DiskCache()
+active_enrichments = set()
+
+
+def _normalize_search_text(value: Optional[str]) -> str:
+    value = (value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _search_memory_key(name: str, affiliation: Optional[str], research_area: Optional[str]) -> str:
+    return "search_memory::" + "::".join([
+        _normalize_search_text(name),
+        _normalize_search_text(affiliation),
+        _normalize_search_text(research_area),
+    ])
+
+
+def _name_variants(name: str) -> list[str]:
+    base = (name or "").strip()
+    variants = []
+    candidates = [
+        base,
+        base.replace("-", " "),
+        base.replace(".", " "),
+    ]
+    tokens = [token for token in re.split(r"[\s\-]+", base) if token]
+    if len(tokens) >= 2:
+        candidates.append(" ".join(tokens))
+        candidates.append(f"{tokens[0]} {tokens[-1]}")
+    for candidate in candidates:
+        cleaned = re.sub(r"\s+", " ", candidate).strip()
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+    return variants[:4]
+
+
+def _affiliation_variants(affiliation: Optional[str]) -> list[Optional[str]]:
+    if not affiliation:
+        return [None]
+    base = affiliation.strip()
+    lowered = base.lower()
+    aliases = {
+        "iitm": ["IIT Madras", "Indian Institute of Technology Madras"],
+        "iitd": ["IIT Delhi", "Indian Institute of Technology Delhi"],
+        "iitb": ["IIT Bombay", "Indian Institute of Technology Bombay"],
+        "iitk": ["IIT Kanpur", "Indian Institute of Technology Kanpur"],
+        "iisc": ["Indian Institute of Science", "IISc Bangalore"],
+        "mit": ["Massachusetts Institute of Technology", "MIT"],
+        "stanford": ["Stanford University"],
+    }
+    variants = [base]
+    for key, values in aliases.items():
+        if lowered == key or lowered in {value.lower() for value in values}:
+            variants.extend(values)
+    deduped = []
+    for variant in variants:
+        cleaned = variant.strip()
+        if cleaned and cleaned not in deduped:
+            deduped.append(cleaned)
+    return deduped[:4]
+
+
+def _dedupe_raw_profiles(raw_profiles: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for profile in raw_profiles:
+        key = (
+            profile.get("source", ""),
+            profile.get("orcid_id", "") or profile.get("orcid_url", ""),
+            profile.get("openalex_url", ""),
+            profile.get("semantic_scholar_url", ""),
+            profile.get("scholar_id", ""),
+            _normalize_search_text(profile.get("name", "")),
+            _normalize_search_text((profile.get("affiliations") or [""])[0]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(profile)
+    return deduped
+
+
+async def _fetch_profiles_with_fallbacks(name: str, affiliation: Optional[str], research_area: Optional[str]) -> list[dict]:
+    attempts = []
+    for name_variant in _name_variants(name):
+        for affiliation_variant in _affiliation_variants(affiliation):
+            attempts.append((name_variant, affiliation_variant))
+
+    raw_profiles = []
+    for index, (name_variant, affiliation_variant) in enumerate(attempts):
+        fetched = await scraper.fetch_all(name_variant, affiliation_variant, research_area)
+        if fetched:
+            raw_profiles.extend(fetched)
+            raw_profiles = _dedupe_raw_profiles(raw_profiles)
+        if raw_profiles and (len(raw_profiles) >= 20 or index >= 1):
+            break
+    return raw_profiles
+
+
+async def _enrich_and_store(cache_key: str, memory_key: str, result: dict):
+    try:
+        profiles = deepcopy(result.get("profiles", []))
+        enriched = await asyncio.gather(*(scraper.enrich_profile(profile) for profile in profiles[:BACKGROUND_ENRICH_LIMIT]))
+        profiles[:len(enriched)] = enriched
+        result["profiles"] = profiles
+        result["count"] = len(profiles)
+        result["enrichment_status"] = "complete"
+        cache.set(cache_key, result, ttl=3600)
+        cache.set(memory_key, result, ttl=SEARCH_MEMORY_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(f"Background enrichment failed for {cache_key}: {e}")
+        result["enrichment_status"] = "failed"
+        cache.set(cache_key, result, ttl=3600)
+        cache.set(memory_key, result, ttl=SEARCH_MEMORY_TTL_SECONDS)
+    finally:
+        active_enrichments.discard(cache_key)
+
+
+def _has_meaningful_profile_data(profile: dict) -> bool:
+    metrics = profile.get("metrics", {})
+    return any([
+        profile.get("designation"),
+        profile.get("university"),
+        profile.get("department"),
+        profile.get("location"),
+        profile.get("email"),
+        profile.get("phone"),
+        profile.get("homepage"),
+        profile.get("research_areas"),
+        profile.get("course_works"),
+        profile.get("publications"),
+        profile.get("affiliations"),
+        any(metrics.get(key, 0) > 0 for key in ("citations", "h_index", "i10_index", "paper_count")),
+    ])
 
 
 @app.on_event("startup")
@@ -85,9 +225,10 @@ async def search_faculty(
     name: str = Query(..., min_length=2, description="Faculty member name"),
     affiliation: Optional[str] = Query(None, description="University or institution"),
     research_area: Optional[str] = Query(None, description="Research domain"),
-    limit: int = Query(5, ge=1, le=20)
+    limit: int = Query(20, ge=1, le=50)
 ):
     cache_key = f"search_{name}_{affiliation}_{research_area}_{limit}"
+    memory_key = _search_memory_key(name, affiliation, research_area)
     cached = cache.get(cache_key)
     if cached:
         logger.info(f"[Cache HIT] {name}")
@@ -96,28 +237,67 @@ async def search_faculty(
     logger.info(f"[Search] name={name!r} affiliation={affiliation!r}")
 
     try:
-        raw_profiles = await scraper.fetch_all(name, affiliation, research_area)
+        raw_profiles = await _fetch_profiles_with_fallbacks(name, affiliation, research_area)
         if not raw_profiles:
+            logger.warning("Initial source fetch returned no profiles; retrying once.")
+            raw_profiles = await _fetch_profiles_with_fallbacks(name, affiliation, research_area)
+        if not raw_profiles:
+            remembered = cache.get(memory_key)
+            if remembered:
+                logger.info(f"[Memory HIT] {name}")
+                remembered["memory_fallback"] = True
+                remembered["profiles"] = remembered.get("profiles", [])[:limit]
+                remembered["count"] = len(remembered["profiles"])
+                remembered["search_id"] = cache_key
+                remembered["enrichment_status"] = "complete"
+                return remembered
             raise HTTPException(status_code=404, detail=f"No profiles found for '{name}'")
 
         resolved = entity_resolver.resolve(raw_profiles, name, affiliation)
-        profiles = [profile_builder.build(p) for p in resolved[:limit]]
+        profiles = [profile_builder.build(p) for p in resolved]
+        profiles = [p for p in profiles if _has_meaningful_profile_data(p)]
+        if not profiles:
+            raise HTTPException(status_code=404, detail=f"No detailed profiles found for '{name}'")
         query = f"{name} {affiliation or ''} {research_area or ''}".strip()
-        ranked = search_engine.rank(profiles, query)
+        ranked = search_engine.rank(profiles, query)[:limit]
 
         result = {
             "query": {"name": name, "affiliation": affiliation, "research_area": research_area},
             "count": len(ranked),
-            "profiles": ranked
+            "profiles": ranked,
+            "memory_fallback": False,
+            "search_id": cache_key,
+            "enrichment_status": "pending",
         }
         cache.set(cache_key, result, ttl=3600)
+        cache.set(memory_key, result, ttl=SEARCH_MEMORY_TTL_SECONDS)
+        if cache_key not in active_enrichments:
+            active_enrichments.add(cache_key)
+            asyncio.create_task(_enrich_and_store(cache_key, memory_key, deepcopy(result)))
         return result
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
+        remembered = cache.get(memory_key)
+        if remembered:
+            logger.info(f"[Memory RECOVERY] {name}")
+            remembered["memory_fallback"] = True
+            remembered["profiles"] = remembered.get("profiles", [])[:limit]
+            remembered["count"] = len(remembered["profiles"])
+            remembered["search_id"] = cache_key
+            remembered["enrichment_status"] = "complete"
+            return remembered
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search/status", tags=["Search"])
+def search_status(search_id: str):
+    cached = cache.get(search_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Search status not found")
+    return cached
 
 
 @app.get("/profile/{scholar_id}", tags=["Profile"])

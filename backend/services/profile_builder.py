@@ -42,6 +42,11 @@ class ProfileBuilder:
         phone       = raw.get("phone", "")
         homepage    = _clean_url(raw.get("homepage", ""))
 
+        if not location and affiliations:
+            location = affiliations[0]
+        if not university and location and location not in affiliations:
+            affiliations.insert(0, location)
+
         academic_profiles = {}
         if raw.get("scholar_url"):
             academic_profiles["google_scholar"] = raw["scholar_url"]
@@ -88,4 +93,5 @@ class ProfileBuilder:
             "sources":         raw.get("sources", [raw.get("source", "")]),
             "disambiguation_score": raw.get("disambiguation_score", 0),
             "relevance_score":      raw.get("relevance_score", 0),
+            "source_relevance":     raw.get("source_relevance", 0),
         }

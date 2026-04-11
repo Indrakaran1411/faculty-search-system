@@ -31,6 +31,7 @@ class Publication(BaseModel):
     title: str = ""
     year: str = ""
     citations: int = 0
+    venue: str = ""
 
 
 class AcademicMetrics(BaseModel):
@@ -49,15 +50,18 @@ class AcademicProfiles(BaseModel):
 
 class FacultyProfile(BaseModel):
     name: str = ""
+    designation: str = ""
     university: str = ""
     department: str = ""
     affiliations: List[str] = []
     location: str = ""
     email: str = ""
+    phone: str = ""
     homepage: str = ""
     profile_image: str = ""
     research_areas: List[str] = []
     research_summary: str = ""
+    course_works: List[str] = []
     publications: List[Publication] = []
     metrics: AcademicMetrics = AcademicMetrics()
     academic_profiles: Dict[str, str] = {}
