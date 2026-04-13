@@ -33,3 +33,29 @@ export async function fetchSearchStatus(searchId) {
   }
   return res.json()
 }
+
+export async function fetchSummarize(profile) {
+  const res = await fetch(`${API_BASE}/ai/summarize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+    throw new Error(err.detail || `Request failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function fetchAsk(profile, question) {
+  const res = await fetch(`${API_BASE}/ai/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile, question }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+    throw new Error(err.detail || `Request failed: ${res.status}`)
+  }
+  return res.json()
+}

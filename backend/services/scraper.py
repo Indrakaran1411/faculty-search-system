@@ -56,7 +56,11 @@ class FacultyScraper:
 
     def _extract_openalex_affiliations(self, author: Dict):
         raw_affiliations = author.get("affiliations", []) or []
-        last_known = author.get("last_known_institutions", []) or []
+        # OpenAlex API uses both `last_known_institutions` (old) and `last_known_institution` (new, singular)
+        last_known_list = author.get("last_known_institutions") or []
+        last_known_single = author.get("last_known_institution")
+        if not last_known_list and last_known_single:
+            last_known_list = [last_known_single] if isinstance(last_known_single, dict) else []
         institutions = []
 
         for item in raw_affiliations:
@@ -72,7 +76,7 @@ class FacultyScraper:
                 })
 
         if not institutions:
-            for institution in last_known:
+            for institution in last_known_list:
                 name = institution.get("display_name", "")
                 if name:
                     institutions.append({
@@ -102,6 +106,25 @@ class FacultyScraper:
         primary = deduped[0] if deduped else {}
         location = ", ".join(filter(None, [primary.get("name", ""), primary.get("country", "")]))
         return names, primary.get("name", ""), location
+
+    def _extract_openalex_research_areas(self, author: Dict) -> List[str]:
+        """Extract research areas from both x_concepts (old) and topics (new) OpenAlex fields."""
+        areas = []
+        # Try newer `topics` field first
+        topics = author.get("topics", []) or []
+        for t in topics[:8]:
+            name = t.get("display_name", "")
+            if name and name not in areas:
+                areas.append(name)
+        # Fall back to deprecated `x_concepts` if needed
+        if not areas:
+            concepts = author.get("x_concepts", []) or []
+            for c in concepts[:8]:
+                if c.get("level", 0) <= 2:
+                    name = c.get("display_name", "")
+                    if name and name not in areas:
+                        areas.append(name)
+        return areas[:6]
 
     # ─────────────────────────────────────────────
     # MAIN
@@ -541,8 +564,14 @@ class FacultyScraper:
             results = []
             for a in data.get("results", []):
                 affiliations, university, location = self._extract_openalex_affiliations(a)
-                concepts = a.get("x_concepts", [])
-                research_areas = [c.get("display_name", "") for c in concepts[:6] if c.get("level", 0) <= 2]
+                research_areas = self._extract_openalex_research_areas(a)
+
+                # Affiliation filter: skip if affiliation provided and not matching
+                if affiliation and university:
+                    aff_lower = affiliation.lower()
+                    uni_lower = university.lower()
+                    if not any(token in uni_lower for token in aff_lower.split() if len(token) > 3):
+                        pass  # still include, entity resolver will sort relevance
 
                 author_id = a.get("id", "").split("/")[-1]
                 publications = await asyncio.to_thread(self._fetch_openalex_works, author_id)
@@ -605,7 +634,10 @@ class FacultyScraper:
         query = name + (f" {affiliation}" if affiliation else "")
         params = {
             "query": query, "limit": 20,
-            "fields": "name,affiliations,paperCount,citationCount,hIndex,homepage,papers.title,papers.year,papers.citationCount,papers.venue"
+            "fields": (
+                "name,affiliations,paperCount,citationCount,hIndex,homepage,"
+                "externalIds,papers.title,papers.year,papers.citationCount,papers.venue"
+            )
         }
         try:
             data = await asyncio.to_thread(
@@ -617,8 +649,15 @@ class FacultyScraper:
             results = []
             for a in data.get("data", []):
                 papers = a.get("papers", [])
-                affils = [af.get("name", "") for af in a.get("affiliations", [])]
+                affils = [af.get("name", "") for af in (a.get("affiliations") or [])]
                 designation, department, university = self._parse_affiliation(" | ".join(affils))
+
+                # Extract ORCID from externalIds
+                external_ids = a.get("externalIds") or {}
+                orcid_id = external_ids.get("ORCID", "")
+                orcid_url = f"https://orcid.org/{orcid_id}" if orcid_id else ""
+
+                author_id = a.get("authorId", "")
                 results.append({
                     "source": "semantic_scholar",
                     "name": a.get("name", ""),
@@ -631,7 +670,8 @@ class FacultyScraper:
                     "citation_count": a.get("citationCount", 0),
                     "h_index": a.get("hIndex", 0),
                     "homepage": a.get("homepage", ""),
-                    "semantic_scholar_url": f"https://www.semanticscholar.org/author/{a.get('authorId', '')}",
+                    "semantic_scholar_url": f"https://www.semanticscholar.org/author/{author_id}" if author_id else "",
+                    "orcid_url": orcid_url,
                     "research_areas": [],
                     "profile_image": "",
                     "publications": [

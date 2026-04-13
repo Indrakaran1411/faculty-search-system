@@ -10,10 +10,10 @@ export default function ResultsList({ results, searchTime }) {
           {results.count} profile{results.count !== 1 ? "s" : ""} found for{" "}
           <strong>"{results.query.name}"</strong>
         </span>
-        <span className="results-scope">Worldwide sources</span>
-        {results.memory_fallback && <span className="results-memory">Recovered from local memory</span>}
-        {results.enrichment_status === "pending" && <span className="results-enriching">Enriching details</span>}
-        {searchTime && <span className="search-time">⚡ {searchTime}s</span>}
+        <span className="badge-pill results-scope">🌐 Worldwide sources</span>
+        {results.memory_fallback && <span className="badge-pill results-memory">💾 From memory</span>}
+        {results.enrichment_status === "pending" && <span className="badge-pill results-enriching">⚡ Enriching…</span>}
+        {searchTime && <span className="badge-pill search-time">⚡ {searchTime}s</span>}
         <div className="sources-legend">
           Sources: <SourceTag source="google_scholar" />
           <SourceTag source="semantic_scholar" />

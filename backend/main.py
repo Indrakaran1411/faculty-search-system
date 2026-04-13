@@ -20,6 +20,7 @@ from services.scraper import FacultyScraper
 from services.search_engine import HybridSearchEngine
 from services.entity_resolver import EntityResolver
 from services.profile_builder import ProfileBuilder
+from services.llm_service import summarize_profile, answer_question
 from utils.cache import DiskCache
 
 logging.basicConfig(
@@ -261,6 +262,14 @@ async def search_faculty(
         query = f"{name} {affiliation or ''} {research_area or ''}".strip()
         ranked = search_engine.rank(profiles, query)[:limit]
 
+        # Auto-generate AI research summaries for top 5 profiles
+        for prof in ranked[:5]:
+            if not prof.get("research_summary"):
+                try:
+                    prof["research_summary"] = summarize_profile(prof)
+                except Exception as exc:
+                    logger.warning(f"Summary generation failed: {exc}")
+
         result = {
             "query": {"name": name, "affiliation": affiliation, "research_area": research_area},
             "count": len(ranked),
@@ -323,6 +332,43 @@ async def get_profile_by_id(scholar_id: str):
 def clear_cache():
     cache.clear()
     return {"message": "Cache cleared"}
+
+
+# ── AI Endpoints ─────────────────────────────────────────────────
+
+@app.post("/ai/summarize", tags=["AI"])
+def ai_summarize(profile: dict):
+    """
+    Accept a faculty profile dict and return an AI-generated research summary.
+    """
+    if not profile:
+        raise HTTPException(status_code=400, detail="Profile data is required.")
+    try:
+        summary = summarize_profile(profile)
+        return {"summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ai/ask", tags=["AI"])
+def ai_ask(payload: dict):
+    """
+    RAG-based Q&A: given a faculty profile dict and a question string,
+    return an intelligent answer grounded in the profile data.
+
+    Payload: { "profile": {...}, "question": "..." }
+    """
+    profile = payload.get("profile")
+    question = payload.get("question", "").strip()
+    if not profile:
+        raise HTTPException(status_code=400, detail="'profile' is required.")
+    if not question:
+        raise HTTPException(status_code=400, detail="'question' is required.")
+    try:
+        answer = answer_question(profile, question)
+        return {"question": question, "answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
